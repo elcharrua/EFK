@@ -17,29 +17,52 @@ subjects:
     name: tiller
     namespace: elk
 ---
-  kind: Service
-  apiVersion: v1
-  metadata:
-    name: elasticsearch
-    labels:
-      app: elasticsearch
-  spec:
-    selector:
-      app: elasticsearch
-    clusterIP: None
-    ports:
-      - port: 9200
-        name: rest
-      - port: 9300
-        name: inter-node
+apiVersion: v1
+kind: Service
+metadata:
+  name: elasticsearch
+  labels:
+    app: elasticsearch
+spec:
+  selector:
+    app: elasticsearch
+  clusterIP: None
+  ports:
+    - port: 9200
+      name: rest
+    - port: 9300
+      name: inter-node
 ---
-
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: generate-certs
+spec:
+  template:
+    metadata:
+      name: generate-certs
+      labels:
+        app: elasticsearch
+    spec:
+      containers:
+        - name: generate-certs
+          image: docker.elastic.co/elasticsearch/elasticsearch:7.13.2
+          command: ["/bin/sh"]
+          args: ["-c", "bin/elasticsearch-certutil ca --silent --out /certs/ca.p12 -pass '' && bin/elasticsearch-certutil cert --silent --ca /certs/ca.p12 --ca-pass '' --out /certs/elastic-certificates.p12 --pass ''"]
+          volumeMounts:
+            - name: cert-volume
+              mountPath: /certs
+      restartPolicy: Never
+      volumes:
+        - name: cert-volume
+          emptyDir: {}
+---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: es-cluster
 spec:
-  serviceName: elasticsearch # provides association with our previously created elasticsearch Service.
+  serviceName: elasticsearch
   replicas: 3
   selector:
     matchLabels:
@@ -50,92 +73,71 @@ spec:
         app: elasticsearch
     spec:
       containers:
-      - name: elasticsearch
-        image: docker.elastic.co/elasticsearch/elasticsearch:7.13.2
-        resources:
+        - name: elasticsearch
+          image: docker.elastic.co/elasticsearch/elasticsearch:7.13.2
+          resources:
             limits:
-              cpu: 1000m
+              cpu: "1000m"
               memory: "2Gi"
             requests:
-              cpu: 100m
+              cpu: "100m"
               memory: "2Gi"
-        ports:
-        - containerPort: 9200 # for REST API.
-          name: rest
-          protocol: TCP
-        - containerPort: 9300 # for inter-node communication.
-          name: inter-node
-          protocol: TCP
-        volumeMounts:
-        - name: data
-          mountPath: /usr/share/elasticsearch/data
-        - name: elastic-tls-cert
-          mountPath: /usr/share/elasticsearch/config/certificates/elastic-certificates.p12
-          subPath: elastic-certificates.p12
-        env:
-          - name: cluster.name
-            value: k8s-logs
-          - name: node.name
-            valueFrom:
-              fieldRef:
-                fieldPath: metadata.name
-          # sets a list of master-eligible nodes in the cluster.
-          - name: discovery.seed_hosts
-            value: "es-cluster-0.elasticsearch, es-cluster-1.elasticsearch, es-cluster-2.elasticsearch"
-          # specifies a list of master-eligible nodes that will participate in the master election process.
-          - name: cluster.initial_master_nodes
-            value: "es-cluster-0, es-cluster-1, es-cluster-2"
-          - name: ES_JAVA_OPTS
-            value: "-Xms1g -Xmx1g"
-          - name: xpack.security.transport.ssl.enabled
-            value: "true"
-          - name: xpack.security.enabled
-            value: "true"
-          - name: xpack.security.transport.ssl.verification_mode
-            value: "certificate"
-          - name: xpack.security.transport.ssl.client_authentication
-            value: "required"
-          - name: xpack.security.transport.ssl.keystore.path
-            value: /usr/share/elasticsearch/config/certificates/elastic-certificates.p12
-          - name: xpack.security.transport.ssl.truststore.path
-            value: /usr/share/elasticsearch/config/certificates/elastic-certificates.p12
-
-      # Each init containers run to completion in the specified order.
+          ports:
+            - containerPort: 9200
+              name: rest
+              protocol: TCP
+            - containerPort: 9300
+              name: inter-node
+              protocol: TCP
+          volumeMounts:
+            - name: data
+              mountPath: /usr/share/elasticsearch/data
+            - name: cert-volume
+              mountPath: /certs
+          env:
+            - name: cluster.name
+              value: k8s-logs
+            - name: node.name
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: discovery.seed_hosts
+              value: "es-cluster-0.elasticsearch,es-cluster-1.elasticsearch,es-cluster-2.elasticsearch"
+            - name: cluster.initial_master_nodes
+              value: "es-cluster-0,es-cluster-1,es-cluster-2"
+            - name: ES_JAVA_OPTS
+              value: "-Xms1g -Xmx1g"
+            - name: xpack.security.transport.ssl.enabled
+              value: "true"
+            - name: xpack.security.enabled
+              value: "true"
       initContainers:
-      # By default k8s mounts the data directory as root, which renders it inaccessible to Elasticsearch.
-      - name: fix-permissions
-        image: busybox
-        command: ["sh", "-c", "chown -R 1000:1000 /usr/share/elasticsearch/data"]
-        securityContext:
-          privileged: true
-        volumeMounts:
-        - name: data
-          mountPath: /usr/share/elasticsearch/data
-      # To prevent OOM errors.
-      - name: increase-vm-max-map
-        image: busybox
-        command: ["sysctl", "-w", "vm.max_map_count=262144"]
-        securityContext:
-          privileged: true
-      # Increase the max number of open file descriptors. 
-      - name: increase-fd-ulimit
-        image: busybox
-        command: ["sh", "-c", "ulimit -n 65536"]
-        securityContext:
-          privileged: true
-  # PersistentVolumes for the Elasticsearch pods.
-      volumes:
-      - name: elastic-tls-cert
-        secret:
-          secretName: elastic-tls-cert
+        - name: fix-permissions
+          image: busybox
+          command: ["sh", "-c", "chown -R 1000:1000 /usr/share/elasticsearch/data"]
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: data
+              mountPath: /usr/share/elasticsearch/data
+        - name: increase-vm-max-map
+          image: busybox
+          command: ["sysctl", "-w", "vm.max_map_count=262144"]
+          securityContext:
+            privileged: true
+        - name: increase-fd-ulimit
+          image: busybox
+          command: ["sh", "-c", "ulimit -n 65536"]
+          securityContext:
+            privileged: true
   volumeClaimTemplates:
-  - metadata:
-      name: data
-      labels:
-        app: elasticsearch
-    spec:
-      accessModes: [ "ReadWriteOnce" ]
-      storageClassName: standard
-      resources:
-        requests:
-          storage: 20Gi
+    - metadata:
+        name: data
+        labels:
+          app: elasticsearch
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        storageClassName: standard
+        resources:
+          requests:
+            storage: 20Gi
