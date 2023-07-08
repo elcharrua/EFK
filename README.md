@@ -1,5 +1,4 @@
 **README.MD**
-Este arquivo **README.MD** descreve os recursos dos arquivos de configuração YAML fornecidos e como eles funcionam juntos para criar um ambiente de monitoramento de logs com Elasticsearch, Fluentd e Kibana.
 
 **elasticsearch.yaml**
 Este arquivo contém as definições para implantar o Elasticsearch no Kubernetes. Ele consiste nos seguintes recursos:
