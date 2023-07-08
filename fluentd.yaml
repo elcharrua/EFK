@@ -9,9 +9,8 @@ metadata:
     kubernetes.io/cluster-service: "true"
 data:
   fluent.conf: |-
-    # ignora logs do fluentd
+    # Ignora logs do fluentd
     <match fluent.**>
-      # this tells fluentd to not output its log on stdout
       @type null
     </match>
 
@@ -86,13 +85,10 @@ data:
       @type elasticsearch_dynamic
       @id out_es
       @log_level info
-
       include_tag_key true
       host "#{ENV['FLUENT_ELASTICSEARCH_HOST']}"
       port "#{ENV['FLUENT_ELASTICSEARCH_PORT']}"
-      # path "#{ENV['FLUENT_ELASTICSEARCH_PATH']}"
       scheme "#{ENV['FLUENT_ELASTICSEARCH_SCHEME'] || 'http'}"
-      # ssl_verify "#{ENV['FLUENT_ELASTICSEARCH_SSL_VERIFY'] || 'true'}"
       user "#{ENV['FLUENT_ELASTICSEARCH_USER']}"
       password "#{ENV['FLUENT_ELASTICSEARCH_PASSWORD']}"
       reload_connections "#{ENV['FLUENT_ELASTICSEARCH_RELOAD_CONNECTIONS'] || 'true'}"
@@ -106,7 +102,6 @@ data:
       disable_retry_limit
       num_threads "#{ENV['FLUENT_ELASTICSEARCH_BUFFER_FLUSH_THREAD_COUNT'] || '8'}"
     </match>
-
 ---
 
 apiVersion: v1
@@ -114,9 +109,7 @@ kind: ServiceAccount
 metadata:
   name: fluentd
   namespace: elk
-
 ---
-
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -132,9 +125,7 @@ rules:
   - get
   - list
   - watch
-
 ---
-
 kind: ClusterRoleBinding
 apiVersion: rbac.authorization.k8s.io/v1
 metadata:
@@ -149,79 +140,294 @@ subjects:
   namespace: elk
 ---
 
-  apiVersion: apps/v1
-  kind: DaemonSet
-  metadata:
-    name: fluentd
-    namespace: elk
-    labels:
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluentd
+  namespace: elk
+  labels:
+    k8s-app: fluentd-logging
+    version: v1
+    kubernetes.io/cluster-service: "true"
+spec:
+  template:
+    metadata:
+      labels:
+        k8s-app: fluentd-logging
+        version: v1
+        kubernetes.io/cluster-service: "true"
+    spec:
+      serviceAccount: fluentd
+      tolerations:
+      - key: node-role.kubernetes.io/master
+        effect: NoSchedule
+      containers:
+      - name: fluentd
+        image: fluent/fluentd-kubernetes-daemonset:v1.12.4-debian-elasticsearch7-1.1
+        env:
+          - name:  FLUENT_ELASTICSEARCH_HOST
+            value: "elasticsearch"
+          - name:  FLUENT_ELASTICSEARCH_PORT
+            value: "9200"
+          - name: FLUENT_ELASTICSEARCH_SCHEME
+            value: "http"
+          - name: FLUENT_UID
+            value: "0"
+          - name: FLUENTD_SYSTEMD_CONF
+            value: disable
+          - name: FLUENT_CONTAINER_TAIL_EXCLUDE_PATH
+            value: /var/log/containers/fluent*
+          - name: FLUENT_CONTAINER_TAIL_PARSER_TYPE
+            value: /^(?<time>.+) (?<stream>stdout|stderr)( (?<logtag>.))? (?<log>.*)$/
+          - name: FLUENT_ELASTICSEARCH_USER # even if not used they are necessary
+            value: "elastic"
+          - name: FLUENT_ELASTICSEARCH_PASSWORD # even if not used they are necessary
+            valueFrom:
+              secretKeyRef:
+                name: bff-elk-pw-prd-elastic
+                key: password
+        resources:
+          limits:
+            memory: 200Mi
+          requests:
+            cpu: 100m
+            memory: 200Mi
+        volumeMounts:
+        - name: varlog
+          mountPath: /var/log
+        - name: varlibdockercontainers
+          mountPath: /var/lib/docker/containers
+          readOnly: true
+        - name: fluentd-config
+          mountPath: /fluentd/etc
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - name: varlog
+        hostPath:
+          path: /var/log
+      - name: varlibdockercontainers
+        hostPath:
+          path: /var/lib/docker/containers
+      - name: fluentd-config
+        configMap:
+          name: fluentd-config
+  selector:
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluentd-config
+  namespace: elk
+  labels:
+    k8s-app: fluentd-logging
+    version: v1
+    kubernetes.io/cluster-service: "true"
+data:
+  fluent.conf: |-
+    # Ignora logs do Fluentd
+    <match fluent.**>
+      @type null
+    </match>
+
+    # Coleta todos os logs de containers
+    <source>
+      @id kubernetes-containers.log
+      @type tail
+      path /var/log/containers/*.log
+      pos_file /var/log/kubernetes-containers.log.pos
+      tag raw.kubernetes.*
+      read_from_head true
+      <parse>
+        @type multi_format
+        <pattern>
+          format json
+          time_key time
+          time_format %Y-%m-%dT%H:%M:%S.%NZ
+        </pattern>
+        <pattern>
+          format /^(?<time>.+) (?<stream>stdout|stderr) [^ ]* (?<log>.*)$/
+          time_format %Y-%m-%dT%H:%M:%S.%N%:z
+        </pattern>
+      </parse>
+    </source>
+
+    # Detecta exceções na saída do log e encaminha como uma única entrada de log
+    <match raw.kubernetes.**>
+      @id raw.kubernetes
+      @type detect_exceptions
+      remove_tag_prefix raw
+      message log
+      stream stream
+      multiline_flush_interval 5
+      max_bytes 500000
+      max_lines 1000
+    </match>
+
+    # Concatena logs de várias linhas
+    <filter **>
+      @id filter_concat
+      @type concat
+      key message
+      multiline_end_regexp /\n$/
+      separator ""
+    </filter>
+
+    # Adiciona registros com metadados do Kubernetes
+    <filter kubernetes.**>
+      @id filter_kubernetes_metadata
+      @type kubernetes_metadata
+    </filter>
+
+    # Corrige campos JSON para Elasticsearch
+    <filter kubernetes.**>
+      @id filter_parser
+      @type parser
+      key_name log
+      reserve_data true
+      remove_key_name_field true
+      <parse>
+        @type multi_format
+        <pattern>
+          format json
+        </pattern>
+        <pattern>
+          format none
+        </pattern>
+      </parse>
+    </filter>
+
+    <match **>
+      @type elasticsearch_dynamic
+      @id out_es
+      @log_level info
+      include_tag_key true
+      host "#{ENV['FLUENT_ELASTICSEARCH_HOST']}"
+      port "#{ENV['FLUENT_ELASTICSEARCH_PORT']}"
+      scheme "#{ENV['FLUENT_ELASTICSEARCH_SCHEME'] || 'http'}"
+      user "#{ENV['FLUENT_ELASTICSEARCH_USER']}"
+      password "#{ENV['FLUENT_ELASTICSEARCH_PASSWORD']}"
+      reload_connections "#{ENV['FLUENT_ELASTICSEARCH_RELOAD_CONNECTIONS'] || 'true'}"
+      logstash_prefix fluentd-${record['kubernetes']['namespace_name']}
+      logstash_format true
+      type_name fluentd
+      buffer_chunk_limit "#{ENV['FLUENT_ELASTICSEARCH_BUFFER_CHUNK_LIMIT_SIZE'] || '2M'}"
+      buffer_queue_limit "#{ENV['FLUENT_ELASTICSEARCH_BUFFER_QUEUE_LIMIT_LENGTH'] || '32'}"
+      flush_interval "#{ENV['FLUENT_ELASTICSEARCH_BUFFER_FLUSH_INTERVAL'] || '5s'}"
+      max_retry_wait "#{ENV['FLUENT_ELASTICSEARCH_BUFFER_RETRY_MAX_INTERVAL'] || '30'}"
+      disable_retry_limit
+      num_threads "#{ENV['FLUENT_ELASTICSEARCH_BUFFER_FLUSH_THREAD_COUNT'] || '8'}"
+    </match>
+---
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fluentd
+  namespace: elk
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: fluentd
+  namespace: elk
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  - namespaces
+  verbs:
+  - get
+  - list
+  - watch
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: fluentd
+roleRef:
+  kind: ClusterRole
+  name: fluentd
+  apiGroup: rbac.authorization.k8s.io
+subjects:
+- kind: ServiceAccount
+  name: fluentd
+  namespace: elk
+---
+
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluentd
+  namespace: elk
+  labels:
+    k8s-app: fluentd-logging
+    version: v1
+    kubernetes.io/cluster-service: "true"
+spec:
+  template:
+    metadata:
+      labels:
+        k8s-app: fluentd-logging
+        version: v1
+        kubernetes.io/cluster-service: "true"
+    spec:
+      serviceAccount: fluentd
+      tolerations:
+      - key: node-role.kubernetes.io/master
+        effect: NoSchedule
+      containers:
+      - name: fluentd
+        image: fluent/fluentd-kubernetes-daemonset:v1.12.4-debian-elasticsearch7-1.1
+        env:
+          - name:  FLUENT_ELASTICSEARCH_HOST
+            value: "elasticsearch"
+          - name:  FLUENT_ELASTICSEARCH_PORT
+            value: "9200"
+          - name: FLUENT_ELASTICSEARCH_SCHEME
+            value: "http"
+          - name: FLUENT_UID
+            value: "0"
+          - name: FLUENTD_SYSTEMD_CONF
+            value: disable
+          - name: FLUENT_CONTAINER_TAIL_EXCLUDE_PATH
+            value: /var/log/containers/fluent*
+          - name: FLUENT_CONTAINER_TAIL_PARSER_TYPE
+            value: /^(?<time>.+) (?<stream>stdout|stderr)( (?<logtag>.))? (?<log>.*)$/
+          - name: FLUENT_ELASTICSEARCH_USER # mesmo que não seja usado, é necessário
+            value: "elastic"
+          - name: FLUENT_ELASTICSEARCH_PASSWORD # mesmo que não seja usado, é necessário
+            valueFrom:
+              secretKeyRef:
+                name: bff-elk-pw-prd-elastic
+                key: password
+        resources:
+          limits:
+            memory: 200Mi
+          requests:
+            cpu: 100m
+            memory: 200Mi
+        volumeMounts:
+        - name: varlog
+          mountPath: /var/log
+        - name: varlibdockercontainers
+          mountPath: /var/lib/docker/containers
+          readOnly: true
+        - name: fluentd-config
+          mountPath: /fluentd/etc
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - name: varlog
+        hostPath:
+          path: /var/log
+      - name: varlibdockercontainers
+        hostPath:
+          path: /var/lib/docker/containers
+        readOnly: true
+      - name: fluentd-config
+        configMap:
+          name: fluentd-config
+  selector:
+    matchLabels:
       k8s-app: fluentd-logging
       version: v1
       kubernetes.io/cluster-service: "true"
-  spec:
-    template:
-      metadata:
-        labels:
-          k8s-app: fluentd-logging
-          version: v1
-          kubernetes.io/cluster-service: "true"
-      spec:
-        serviceAccount: fluentd
-        serviceAccountName: fluentd
-        tolerations:
-        - key: node-role.kubernetes.io/master
-          effect: NoSchedule
-        containers:
-        - name: fluentd
-          image: fluent/fluentd-kubernetes-daemonset:v1.12.4-debian-elasticsearch7-1.1
-          env:
-            - name:  FLUENT_ELASTICSEARCH_HOST
-              value: "elasticsearch"
-            - name:  FLUENT_ELASTICSEARCH_PORT
-              value: "9200"
-            - name: FLUENT_ELASTICSEARCH_SCHEME
-              value: "http"
-            - name: FLUENT_UID
-              value: "0"
-            - name: FLUENTD_SYSTEMD_CONF
-              value: disable
-            - name: FLUENT_CONTAINER_TAIL_EXCLUDE_PATH
-              value: /var/log/containers/fluent*
-            - name: FLUENT_CONTAINER_TAIL_PARSER_TYPE
-              value: /^(?<time>.+) (?<stream>stdout|stderr)( (?<logtag>.))? (?<log>.*)$/    
-            - name: FLUENT_ELASTICSEARCH_USER # even if not used they are necessary
-              value: "elastic"
-            - name: FLUENT_ELASTICSEARCH_PASSWORD # even if not used they are necessary
-              valueFrom:
-                secretKeyRef:
-                  name: bff-elk-pw-prd-elastic
-                  key: password        
-          resources:
-            limits:
-              memory: 200Mi
-            requests:
-              cpu: 100m
-              memory: 200Mi
-          volumeMounts:
-          - name: varlog
-            mountPath: /var/log
-          - name: varlibdockercontainers
-            mountPath: /var/lib/docker/containers
-            readOnly: true
-          - name: fluentd-config
-            mountPath: /fluentd/etc # path of fluentd config file            
-        terminationGracePeriodSeconds: 30
-        volumes:
-        - name: varlog
-          hostPath:
-            path: /var/log
-        - name: varlibdockercontainers
-          hostPath:
-            path: /var/lib/docker/containers
-        - name: fluentd-config
-          configMap:
-            name: fluentd-config 
-    selector:
-      matchLabels:
-        k8s-app: fluentd-logging
-        
